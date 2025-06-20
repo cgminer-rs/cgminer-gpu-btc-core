@@ -1,0 +1,61 @@
+[package]
+name = "cgminer-gpu-btc-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["CGMiner Rust Team"]
+description = "GPU Bitcoin mining core for CGMiner-RS - provides GPU-based Bitcoin mining using OpenCL/CUDA"
+license = "GPL-3.0"
+repository = "https://github.com/your-org/cgminer-rs"
+keywords = ["bitcoin", "mining", "gpu", "opencl", "cuda"]
+categories = ["hardware-support", "algorithms"]
+
+[dependencies]
+# Core library
+cgminer-core = { path = "../cgminer-core" }
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+sha2 = "0.10"
+async-trait = "0.1"
+fastrand = "2.0"
+
+# GPU computing
+opencl3 = { version = "0.9", optional = true }
+ocl = { version = "0.19", optional = true }
+
+# System info
+num_cpus = "1.16"
+
+# Logging
+tracing = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockall = "0.12"
+
+[features]
+default = ["opencl"]
+opencl = ["opencl3", "ocl"]
+cuda = []
+mock-gpu = []
+
+[lib]
+name = "cgminer_gpu_btc_core"
+crate-type = ["rlib"]  # 只生成rlib，避免LTO冲突
+
+# 如果需要动态库，可以单独构建
+# crate-type = ["cdylib", "rlib"]
