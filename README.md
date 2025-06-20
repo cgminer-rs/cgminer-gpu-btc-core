@@ -1,0 +1,1 @@
+# cgminer-gpu-btc-core
