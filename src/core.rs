@@ -6,6 +6,9 @@ use cgminer_core::{
 };
 use crate::device::GpuDevice;
 use crate::gpu_manager::GpuManager;
+
+#[cfg(feature = "mac-metal")]
+use crate::metal_device::MetalDevice;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -36,24 +39,55 @@ pub struct GpuMiningCore {
 impl GpuMiningCore {
     /// 创建新的GPU挖矿核心
     pub fn new(name: String) -> Self {
+        let mut supported_devices = vec!["gpu".to_string()];
+
+        // 根据编译特性添加支持的设备类型
+        #[cfg(feature = "mac-metal")]
+        supported_devices.push("mac-metal".to_string());
+
+        #[cfg(feature = "opencl")]
+        supported_devices.push("opencl".to_string());
+
+        #[cfg(feature = "cuda")]
+        supported_devices.push("cuda".to_string());
+
         let core_info = CoreInfo::new(
             name.clone(),
             cgminer_core::CoreType::Custom("gpu".to_string()),
             crate::VERSION.to_string(),
-            "GPU挖矿核心，使用OpenCL/CUDA进行高性能SHA256算法计算".to_string(),
+            "GPU挖矿核心，支持Mac M4 Metal、OpenCL、CUDA等多种GPU平台".to_string(),
             "CGMiner Rust Team".to_string(),
-            vec!["gpu".to_string(), "opencl".to_string(), "cuda".to_string()],
+            supported_devices,
         );
 
         let capabilities = CoreCapabilities {
             supports_auto_tuning: true,
-            supports_temperature_monitoring: true,
-            supports_voltage_control: true,
-            supports_frequency_control: true,
-            supports_fan_control: true,
+            temperature_capabilities: cgminer_core::TemperatureCapabilities {
+                supports_monitoring: true,
+                supports_control: true,
+                supports_threshold_alerts: true,
+                monitoring_precision: Some(1.0),
+            },
+            voltage_capabilities: cgminer_core::VoltageCapabilities {
+                supports_monitoring: true,
+                supports_control: true,
+                control_range: Some((800, 1200)), // GPU电压范围
+            },
+            frequency_capabilities: cgminer_core::FrequencyCapabilities {
+                supports_monitoring: true,
+                supports_control: true,
+                control_range: Some((500, 2000)), // GPU频率范围 (MHz)
+            },
+            fan_capabilities: cgminer_core::FanCapabilities {
+                supports_monitoring: true,
+                supports_control: true,
+                fan_count: Some(2), // 大多数GPU有2个风扇
+            },
             supports_multiple_chains: false, // GPU通常不支持多链
             max_devices: Some(16), // GPU核心支持最多16个GPU设备
             supported_algorithms: vec!["SHA256".to_string(), "SHA256d".to_string()],
+            cpu_capabilities: None, // GPU核心不使用CPU特有能力
+            core_type: cgminer_core::CoreType::Custom("gpu".to_string()),
         };
 
         let stats = CoreStats::new(name);
@@ -116,13 +150,16 @@ impl MiningCore for GpuMiningCore {
     async fn start(&mut self) -> Result<(), CoreError> {
         info!("🔥 启动GPU挖矿核心");
 
-        let mut running = self.running.write().map_err(|e| {
-            CoreError::runtime(format!("获取运行状态锁失败: {}", e))
-        })?;
+        // 检查运行状态
+        {
+            let running = self.running.read().map_err(|e| {
+                CoreError::runtime(format!("获取运行状态锁失败: {}", e))
+            })?;
 
-        if *running {
-            warn!("GPU挖矿核心已经在运行");
-            return Ok(());
+            if *running {
+                warn!("GPU挖矿核心已经在运行");
+                return Ok(());
+            }
         }
 
         // 扫描并创建设备
@@ -155,7 +192,14 @@ impl MiningCore for GpuMiningCore {
             }
         }
 
-        *running = true;
+        // 设置运行状态
+        {
+            let mut running = self.running.write().map_err(|e| {
+                CoreError::runtime(format!("获取运行状态锁失败: {}", e))
+            })?;
+            *running = true;
+        }
+
         self.start_time = Some(SystemTime::now());
 
         info!("🎉 GPU挖矿核心启动完成，共启动 {} 个设备", devices.len());
@@ -166,13 +210,16 @@ impl MiningCore for GpuMiningCore {
     async fn stop(&mut self) -> Result<(), CoreError> {
         info!("🛑 停止GPU挖矿核心");
 
-        let mut running = self.running.write().map_err(|e| {
-            CoreError::runtime(format!("获取运行状态锁失败: {}", e))
-        })?;
+        // 检查运行状态
+        {
+            let running = self.running.read().map_err(|e| {
+                CoreError::runtime(format!("获取运行状态锁失败: {}", e))
+            })?;
 
-        if !*running {
-            warn!("GPU挖矿核心已经停止");
-            return Ok(());
+            if !*running {
+                warn!("GPU挖矿核心已经停止");
+                return Ok(());
+            }
         }
 
         // 停止所有设备
@@ -185,7 +232,14 @@ impl MiningCore for GpuMiningCore {
             }
         }
 
-        *running = false;
+        // 设置停止状态
+        {
+            let mut running = self.running.write().map_err(|e| {
+                CoreError::runtime(format!("获取运行状态锁失败: {}", e))
+            })?;
+            *running = false;
+        }
+
         info!("✅ GPU挖矿核心停止完成");
         Ok(())
     }
@@ -204,20 +258,46 @@ impl MiningCore for GpuMiningCore {
     async fn scan_devices(&self) -> Result<Vec<DeviceInfo>, CoreError> {
         debug!("🔍 扫描GPU设备");
 
-        let gpu_manager = self.gpu_manager.as_ref()
-            .ok_or_else(|| CoreError::runtime("GPU管理器未初始化".to_string()))?;
-
-        let gpu_infos = gpu_manager.scan_gpus().await?;
         let mut device_infos = Vec::new();
 
-        for (index, gpu_info) in gpu_infos.iter().enumerate() {
-            let device_info = DeviceInfo::new(
-                index as u32,
-                format!("GPU-{}", index),
-                "gpu".to_string(),
-                0, // GPU通常没有链的概念
-            );
-            device_infos.push(device_info);
+        // 优先扫描 Mac Metal 设备
+        #[cfg(all(feature = "mac-metal", target_os = "macos"))]
+        {
+            use crate::metal_backend::MetalBackend;
+
+            match MetalBackend::new() {
+                Ok(backend) => {
+                    let metal_info = backend.get_device_info();
+                    let device_info = DeviceInfo::new(
+                        0,
+                        format!("Mac Metal GPU: {}", metal_info.name),
+                        "mac-metal".to_string(),
+                        0,
+                    );
+                    device_infos.push(device_info);
+                    info!("🍎 发现 Mac Metal GPU: {}", metal_info.name);
+                }
+                Err(e) => {
+                    debug!("Mac Metal GPU 不可用: {}", e);
+                }
+            }
+        }
+
+        // 如果没有找到 Metal 设备，尝试其他 GPU
+        if device_infos.is_empty() {
+            if let Some(gpu_manager) = &self.gpu_manager {
+                let gpu_infos = gpu_manager.scan_gpus().await?;
+
+                for (index, _gpu_info) in gpu_infos.iter().enumerate() {
+                    let device_info = DeviceInfo::new(
+                        index as u32,
+                        format!("GPU-{}", index),
+                        "gpu".to_string(),
+                        0, // GPU通常没有链的概念
+                    );
+                    device_infos.push(device_info);
+                }
+            }
         }
 
         debug!("✅ 扫描到 {} 个GPU设备", device_infos.len());
@@ -228,6 +308,18 @@ impl MiningCore for GpuMiningCore {
     async fn create_device(&self, device_info: DeviceInfo) -> Result<Box<dyn MiningDevice>, CoreError> {
         info!("🏭 创建GPU设备: {}", device_info.name);
 
+        let device_config = cgminer_core::DeviceConfig::default();
+
+        // 根据平台和特性选择设备类型
+        #[cfg(all(feature = "mac-metal", target_os = "macos"))]
+        {
+            info!("🍎 创建 Mac Metal GPU 设备");
+            let device = MetalDevice::new(device_info, device_config).await?;
+            info!("✅ Mac Metal GPU 设备创建成功");
+            return Ok(Box::new(device));
+        }
+
+        // 回退到通用 GPU 设备
         let gpu_manager = self.gpu_manager.as_ref()
             .ok_or_else(|| CoreError::runtime("GPU管理器未初始化".to_string()))?;
 
@@ -240,8 +332,6 @@ impl MiningCore for GpuMiningCore {
             .and_then(|v| v.as_f64())
             .unwrap_or(1_000_000_000_000.0); // 1 TH/s 默认算力
 
-        let device_config = cgminer_core::DeviceConfig::default();
-
         let device = GpuDevice::new(
             device_info,
             device_config,
@@ -249,7 +339,7 @@ impl MiningCore for GpuMiningCore {
             gpu_manager.clone(),
         ).await?;
 
-        info!("✅ GPU设备创建成功");
+        info!("✅ 通用 GPU 设备创建成功");
         Ok(Box::new(device))
     }
 
@@ -330,11 +420,15 @@ impl MiningCore for GpuMiningCore {
     async fn health_check(&self) -> Result<bool, CoreError> {
         debug!("🏥 GPU挖矿核心健康检查");
 
-        let running = self.running.read().map_err(|e| {
-            CoreError::runtime(format!("获取运行状态锁失败: {}", e))
-        })?;
+        // 检查运行状态
+        let is_running = {
+            let running = self.running.read().map_err(|e| {
+                CoreError::runtime(format!("获取运行状态锁失败: {}", e))
+            })?;
+            *running
+        };
 
-        if !*running {
+        if !is_running {
             return Ok(false);
         }
 

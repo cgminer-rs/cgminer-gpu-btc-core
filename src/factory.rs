@@ -14,13 +14,25 @@ pub struct GpuCoreFactory {
 impl GpuCoreFactory {
     /// 创建新的GPU核心工厂
     pub fn new() -> Self {
+        let mut supported_devices = vec!["gpu".to_string()];
+
+        // 根据编译特性添加支持的设备类型
+        #[cfg(feature = "mac-metal")]
+        supported_devices.push("mac-metal".to_string());
+
+        #[cfg(feature = "opencl")]
+        supported_devices.push("opencl".to_string());
+
+        #[cfg(feature = "cuda")]
+        supported_devices.push("cuda".to_string());
+
         let info = CoreInfo::new(
             "GPU Mining Core Factory".to_string(),
             cgminer_core::CoreType::Custom("gpu".to_string()),
             crate::VERSION.to_string(),
-            "GPU挖矿核心工厂，用于创建和管理GPU挖矿核心实例".to_string(),
+            "GPU挖矿核心工厂，支持Mac M4 Metal、OpenCL、CUDA等多种GPU平台".to_string(),
             "CGMiner Rust Team".to_string(),
-            vec!["gpu".to_string(), "opencl".to_string(), "cuda".to_string()],
+            supported_devices,
         );
 
         Self { info }
@@ -35,18 +47,24 @@ impl Default for GpuCoreFactory {
 
 #[async_trait]
 impl CoreFactory for GpuCoreFactory {
+    /// 获取核心类型
+    fn core_type(&self) -> cgminer_core::CoreType {
+        cgminer_core::CoreType::Custom("gpu".to_string())
+    }
+
     /// 获取核心信息
     fn core_info(&self) -> CoreInfo {
         self.info.clone()
     }
 
     /// 创建挖矿核心实例
-    async fn create_core(&self, name: String) -> Result<Box<dyn MiningCore>, CoreError> {
-        info!("🏭 创建GPU挖矿核心实例: {}", name);
+    async fn create_core(&self, config: cgminer_core::CoreConfig) -> Result<Box<dyn MiningCore>, CoreError> {
+        info!("🏭 创建GPU挖矿核心实例: {}", config.name);
 
-        let core = GpuMiningCore::new(name.clone());
-        
-        debug!("✅ GPU挖矿核心实例 {} 创建成功", name);
+        let mut core = GpuMiningCore::new(config.name.clone());
+        core.initialize(config).await?;
+
+        debug!("✅ GPU挖矿核心实例创建成功");
         Ok(Box::new(core))
     }
 
@@ -102,23 +120,13 @@ impl CoreFactory for GpuCoreFactory {
         Ok(())
     }
 
-    /// 获取支持的设备类型
-    fn supported_devices(&self) -> Vec<String> {
-        vec![
-            "gpu".to_string(),
-            "opencl".to_string(),
-            "cuda".to_string(),
-            "nvidia".to_string(),
-            "amd".to_string(),
-            "intel".to_string(),
-        ]
-    }
+
 
     /// 获取默认配置
     fn default_config(&self) -> cgminer_core::CoreConfig {
         let mut config = cgminer_core::CoreConfig::default();
         config.name = "GPU Mining Core".to_string();
-        
+
         // 设置GPU特定的默认参数
         config.custom_params.insert(
             "max_hashrate".to_string(),
@@ -126,111 +134,51 @@ impl CoreFactory for GpuCoreFactory {
         );
         config.custom_params.insert(
             "device_count".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(8))
+            serde_json::Value::Number(serde_json::Number::from(1)) // Mac 通常只有一个 GPU
         );
         config.custom_params.insert(
             "work_size".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(256))
+            serde_json::Value::Number(serde_json::Number::from(65536)) // Mac M4 优化的工作组大小
         );
-        config.custom_params.insert(
-            "opencl_platform".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(0))
-        );
-        config.custom_params.insert(
-            "cuda_device".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(0))
-        );
+
+        // Mac Metal 特定配置
+        #[cfg(feature = "mac-metal")]
+        {
+            config.custom_params.insert(
+                "backend".to_string(),
+                serde_json::Value::String("metal".to_string())
+            );
+            config.custom_params.insert(
+                "threads_per_threadgroup".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(1024))
+            );
+        }
+
+        // OpenCL 配置
+        #[cfg(feature = "opencl")]
+        {
+            config.custom_params.insert(
+                "opencl_platform".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(0))
+            );
+        }
+
+        // CUDA 配置
+        #[cfg(feature = "cuda")]
+        {
+            config.custom_params.insert(
+                "cuda_device".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(0))
+            );
+        }
 
         config
     }
 
-    /// 检查系统兼容性
-    async fn check_compatibility(&self) -> Result<bool, CoreError> {
-        info!("🔍 检查GPU系统兼容性");
 
-        // 检查OpenCL支持
-        #[cfg(feature = "opencl")]
-        {
-            match self.check_opencl_support().await {
-                Ok(true) => {
-                    info!("✅ OpenCL支持检查通过");
-                    return Ok(true);
-                }
-                Ok(false) => {
-                    debug!("⚠️ OpenCL不可用");
-                }
-                Err(e) => {
-                    debug!("⚠️ OpenCL检查失败: {}", e);
-                }
-            }
-        }
-
-        // 检查CUDA支持
-        #[cfg(feature = "cuda")]
-        {
-            match self.check_cuda_support().await {
-                Ok(true) => {
-                    info!("✅ CUDA支持检查通过");
-                    return Ok(true);
-                }
-                Ok(false) => {
-                    debug!("⚠️ CUDA不可用");
-                }
-                Err(e) => {
-                    debug!("⚠️ CUDA检查失败: {}", e);
-                }
-            }
-        }
-
-        // 如果启用了mock-gpu特性，总是返回兼容
-        #[cfg(feature = "mock-gpu")]
-        {
-            info!("✅ Mock GPU模式，兼容性检查通过");
-            return Ok(true);
-        }
-
-        // 如果没有任何GPU支持，返回不兼容
-        #[cfg(not(any(feature = "opencl", feature = "cuda", feature = "mock-gpu")))]
-        {
-            return Err(CoreError::runtime("没有启用任何GPU后端".to_string()));
-        }
-
-        Ok(false)
-    }
-
-    /// 获取核心版本
-    fn version(&self) -> String {
-        crate::VERSION.to_string()
-    }
 }
 
-impl GpuCoreFactory {
-    /// 检查OpenCL支持
-    #[cfg(feature = "opencl")]
-    async fn check_opencl_support(&self) -> Result<bool, CoreError> {
-        debug!("🔍 检查OpenCL支持");
 
-        // 这里应该实际检查OpenCL平台和设备
-        // 为了简化，我们假设OpenCL可用
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        
-        debug!("✅ OpenCL支持检查完成");
-        Ok(true)
-    }
-
-    /// 检查CUDA支持
-    #[cfg(feature = "cuda")]
-    async fn check_cuda_support(&self) -> Result<bool, CoreError> {
-        debug!("🔍 检查CUDA支持");
-
-        // 这里应该实际检查CUDA运行时和设备
-        // 为了简化，我们假设CUDA可用
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        
-        debug!("✅ CUDA支持检查完成");
-        Ok(true)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -247,39 +195,24 @@ mod tests {
     #[tokio::test]
     async fn test_core_creation() {
         let factory = GpuCoreFactory::new();
-        let core = factory.create_core("Test GPU Core".to_string()).await;
+        let config = factory.default_config();
+        let core = factory.create_core(config).await;
         assert!(core.is_ok());
     }
 
     #[tokio::test]
     async fn test_config_validation() {
         let factory = GpuCoreFactory::new();
-        
+
         // 测试有效配置
         let valid_config = factory.default_config();
         assert!(factory.validate_config(&valid_config).is_ok());
-        
+
         // 测试无效配置
         let mut invalid_config = factory.default_config();
         invalid_config.name = "".to_string();
         assert!(factory.validate_config(&invalid_config).is_err());
     }
 
-    #[tokio::test]
-    async fn test_supported_devices() {
-        let factory = GpuCoreFactory::new();
-        let devices = factory.supported_devices();
-        assert!(devices.contains(&"gpu".to_string()));
-        assert!(devices.contains(&"opencl".to_string()));
-        assert!(devices.contains(&"cuda".to_string()));
-    }
 
-    #[tokio::test]
-    async fn test_compatibility_check() {
-        let factory = GpuCoreFactory::new();
-        // 在测试环境中，兼容性检查应该能够处理各种情况
-        let result = factory.check_compatibility().await;
-        // 不管结果如何，都不应该panic
-        assert!(result.is_ok() || result.is_err());
-    }
 }

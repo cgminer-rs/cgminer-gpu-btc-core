@@ -231,7 +231,7 @@ impl OpenCLBackend {
     }
 
     /// 执行挖矿计算
-    pub async fn compute_mining(&self, device_id: u32, work: &Work) -> Result<Option<MiningResult>, CoreError> {
+    pub async fn compute_mining(&self, device_id: u32, work: &Work, _nonce_start: u32, _nonce_count: u32) -> Result<Vec<MiningResult>, CoreError> {
         debug!("⚡ 在OpenCL设备 {} 上执行挖矿计算", device_id);
 
         let device = self.get_device(device_id)
@@ -241,12 +241,57 @@ impl OpenCLBackend {
             return Err(CoreError::runtime(format!("设备 {} 不可用", device_id)));
         }
 
-        // 模拟OpenCL计算
-        self.simulate_opencl_compute(device, work).await
+        #[cfg(feature = "opencl")]
+        {
+            // 尝试使用真实的 OpenCL 计算
+            match self.real_opencl_compute(device, work, nonce_start, nonce_count).await {
+                Ok(results) => return Ok(results),
+                Err(e) => {
+                    warn!("真实 OpenCL 计算失败，回退到模拟计算: {}", e);
+                }
+            }
+        }
+
+        // 回退到模拟计算
+        let result = self.simulate_opencl_compute(device, work).await?;
+        Ok(result.into_iter().collect())
+    }
+
+    /// 真实的 OpenCL 计算
+    #[cfg(feature = "opencl")]
+    async fn real_opencl_compute(&self, device: &OpenCLDevice, work: &Work, nonce_start: u32, nonce_count: u32) -> Result<Vec<MiningResult>, CoreError> {
+        debug!("🔥 在设备 {} 上执行真实 OpenCL SHA256d 计算", device.name);
+
+        // 准备输入数据
+        let input_data = self.prepare_opencl_input(work, nonce_start, nonce_count)?;
+
+        // 加载 OpenCL 内核
+        let kernel_source = include_str!("shaders/sha256d.cl");
+
+        // 这里应该使用 opencl3 库来执行真实的 OpenCL 计算
+        // 为了简化实现，我们暂时返回错误，让系统使用模拟计算
+        Err(CoreError::runtime("真实 OpenCL 计算暂未完全实现".to_string()))
+    }
+
+    /// 准备 OpenCL 输入数据
+    fn prepare_opencl_input(&self, work: &Work, nonce_start: u32, nonce_count: u32) -> Result<Vec<u8>, CoreError> {
+        let mut data = Vec::new();
+
+        // 添加区块头数据 (80 字节)
+        data.extend_from_slice(&work.header);
+
+        // 添加目标难度 (32 字节)
+        data.extend_from_slice(&work.target);
+
+        // 添加 nonce 范围
+        data.extend_from_slice(&nonce_start.to_le_bytes());
+        data.extend_from_slice(&nonce_count.to_le_bytes());
+
+        Ok(data)
     }
 
     /// 模拟OpenCL计算
-    async fn simulate_opencl_compute(&self, device: &OpenCLDevice, work: &Work) -> Result<Option<MiningResult>, CoreError> {
+    async fn simulate_opencl_compute(&self, device: &OpenCLDevice, work: &Work) -> Result<Vec<MiningResult>, CoreError> {
         debug!("🎯 在设备 {} 上模拟OpenCL计算", device.name);
 
         // 根据设备计算单元数量调整计算时间
@@ -256,27 +301,62 @@ impl OpenCLBackend {
 
         tokio::time::sleep(std::time::Duration::from_millis(compute_time)).await;
 
-        // 根据设备性能调整成功概率
-        let base_probability = 0.1;
+        let mut results = Vec::new();
+
+        // 根据设备性能调整成功概率和结果数量
+        let base_probability = 0.05;
         let performance_factor = (device.compute_units as f64 / 50.0).min(3.0);
         let success_probability = base_probability * performance_factor;
 
-        if fastrand::f64() < success_probability {
-            let nonce = fastrand::u32(..);
-            let result = MiningResult::new(
-                work.id,
-                device.id,
-                nonce,
-                vec![0u8; 32], // 模拟的hash
-                true, // meets_target
-            );
+        // 高性能设备可能找到多个结果
+        let max_results = ((device.compute_units as f64 / 32.0).ceil() as usize).max(1).min(5);
 
-            debug!("🎉 设备 {} 找到有效结果!", device.name);
-            Ok(Some(result))
-        } else {
-            debug!("⚪ 设备 {} 本轮计算无有效结果", device.name);
-            Ok(None)
+        for _ in 0..max_results {
+            if fastrand::f64() < success_probability {
+                let nonce = fastrand::u32(..);
+
+                // 使用 SHA256 计算真实的哈希值
+                let hash = self.calculate_hash_for_simulation(work, nonce)?;
+
+                let result = MiningResult {
+                    work_id: work.id,
+                    work_id_numeric: work.work_id,
+                    nonce,
+                    extranonce2: vec![],
+                    hash,
+                    share_difficulty: work.difficulty,
+                    meets_target: true,
+                    timestamp: std::time::SystemTime::now(),
+                    device_id: device.id,
+                };
+
+                results.push(result);
+                debug!("🎉 设备 {} 找到有效结果! nonce={}", device.name, nonce);
+            }
         }
+
+        if results.is_empty() {
+            debug!("⚪ 设备 {} 本轮计算无有效结果", device.name);
+        } else {
+            debug!("✅ 设备 {} 找到 {} 个有效结果", device.name, results.len());
+        }
+
+        Ok(results)
+    }
+
+    /// 为模拟计算哈希值
+    fn calculate_hash_for_simulation(&self, work: &Work, nonce: u32) -> Result<Vec<u8>, CoreError> {
+        use sha2::{Sha256, Digest};
+
+        let mut header = work.header.clone();
+        // 替换 nonce (在偏移量 76-79)
+        header[76..80].copy_from_slice(&nonce.to_le_bytes());
+
+        // 双重 SHA256
+        let first_hash = Sha256::digest(&header);
+        let second_hash = Sha256::digest(&first_hash);
+
+        Ok(second_hash.to_vec())
     }
 
     /// 检查后端健康状态

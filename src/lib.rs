@@ -1,13 +1,26 @@
 //! CGMiner GPU Core - GPU挖矿核心
 //!
-//! 这个库提供基于GPU的挖矿实现，使用OpenCL/CUDA进行高性能SHA256计算。
-//! GPU核心支持多种GPU设备，提供高算力的比特币挖矿能力。
+//! 这个库提供基于GPU的挖矿实现，支持多种GPU平台：
+//! - Mac M4 GPU (Metal 计算着色器)
+//! - NVIDIA GPU (CUDA) - 预留
+//! - AMD GPU (OpenCL) - 预留
+//! - Intel GPU (OpenCL) - 预留
+//!
+//! GPU核心专注于高性能SHA256d算法计算，提供高算力的比特币挖矿能力。
 
 pub mod core;
 pub mod device;
 pub mod factory;
 pub mod gpu_manager;
+
+// 平台特定的 GPU 后端
 pub mod opencl_backend;
+
+#[cfg(feature = "mac-metal")]
+pub mod metal_backend;
+
+#[cfg(feature = "mac-metal")]
+pub mod metal_device;
 
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
@@ -20,6 +33,9 @@ pub use core::GpuMiningCore;
 pub use device::GpuDevice;
 pub use factory::GpuCoreFactory;
 
+#[cfg(feature = "mac-metal")]
+pub use metal_device::MetalDevice;
+
 use cgminer_core::{CoreType, CoreInfo};
 
 /// 库版本
@@ -27,13 +43,25 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 获取GPU核心信息
 pub fn get_core_info() -> CoreInfo {
+    let mut supported_devices = vec!["gpu".to_string()];
+
+    // 根据编译特性添加支持的设备类型
+    #[cfg(feature = "mac-metal")]
+    supported_devices.push("mac-metal".to_string());
+
+    #[cfg(feature = "opencl")]
+    supported_devices.push("opencl".to_string());
+
+    #[cfg(feature = "cuda")]
+    supported_devices.push("cuda".to_string());
+
     CoreInfo::new(
         "GPU Mining Core".to_string(),
         CoreType::Custom("gpu".to_string()),
         VERSION.to_string(),
-        "GPU挖矿核心，使用OpenCL/CUDA进行高性能SHA256算法计算".to_string(),
+        "GPU挖矿核心，支持Mac M4 Metal、OpenCL、CUDA等多种GPU平台".to_string(),
         "CGMiner Rust Team".to_string(),
-        vec!["gpu".to_string(), "opencl".to_string(), "cuda".to_string()],
+        supported_devices,
     )
 }
 

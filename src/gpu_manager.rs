@@ -51,20 +51,20 @@ impl GpuInfo {
     /// 更新GPU状态
     pub fn update_status(&mut self) {
         use fastrand;
-        
+
         // 模拟温度变化
         self.temperature = 60.0 + fastrand::f32() * 25.0; // 60-85°C
-        
+
         // 模拟功耗变化
         self.power_usage = 150.0 + fastrand::f32() * 100.0; // 150-250W
-        
+
         // 模拟风扇转速变化
         self.fan_speed = if self.temperature > 75.0 {
             70 + fastrand::u32(..30) // 70-100%
         } else {
             30 + fastrand::u32(..40) // 30-70%
         };
-        
+
         // 检查可用性
         self.available = self.temperature < 90.0 && self.power_usage < 300.0;
     }
@@ -96,19 +96,29 @@ impl GpuManager {
     pub async fn initialize(&self) -> Result<(), CoreError> {
         info!("🚀 初始化GPU管理器");
 
-        let mut initialized = self.initialized.write().map_err(|e| {
-            CoreError::runtime(format!("获取初始化状态锁失败: {}", e))
-        })?;
+        // 检查初始化状态
+        {
+            let initialized = self.initialized.read().map_err(|e| {
+                CoreError::runtime(format!("获取初始化状态锁失败: {}", e))
+            })?;
 
-        if *initialized {
-            warn!("GPU管理器已经初始化");
-            return Ok(());
+            if *initialized {
+                warn!("GPU管理器已经初始化");
+                return Ok(());
+            }
         }
 
         // 扫描GPU设备
         self.scan_and_initialize_gpus().await?;
 
-        *initialized = true;
+        // 设置初始化状态
+        {
+            let mut initialized = self.initialized.write().map_err(|e| {
+                CoreError::runtime(format!("获取初始化状态锁失败: {}", e))
+            })?;
+            *initialized = true;
+        }
+
         info!("✅ GPU管理器初始化完成");
         Ok(())
     }
@@ -116,12 +126,6 @@ impl GpuManager {
     /// 扫描并初始化GPU设备
     async fn scan_and_initialize_gpus(&self) -> Result<(), CoreError> {
         debug!("🔍 扫描GPU设备");
-
-        let mut gpus = self.gpus.write().map_err(|e| {
-            CoreError::runtime(format!("获取GPU列表锁失败: {}", e))
-        })?;
-
-        gpus.clear();
 
         // 模拟扫描不同类型的GPU
         let mock_gpus = vec![
@@ -131,28 +135,49 @@ impl GpuManager {
             GpuInfo::new(3, "AMD Radeon RX 7800 XT".to_string(), "AMD".to_string()),
         ];
 
+        let mut final_gpus = Vec::new();
+
         // 在实际实现中，这里会调用OpenCL/CUDA API来扫描真实的GPU
         #[cfg(feature = "mock-gpu")]
         {
-            gpus.extend(mock_gpus);
-            info!("🎭 Mock GPU模式：添加了 {} 个模拟GPU", gpus.len());
+            final_gpus.extend(mock_gpus);
+            info!("🎭 Mock GPU模式：添加了 {} 个模拟GPU", final_gpus.len());
         }
 
         #[cfg(not(feature = "mock-gpu"))]
         {
             // 实际的GPU扫描逻辑
-            if let Err(e) = self.scan_real_gpus(&mut gpus).await {
+            if let Err(e) = self.scan_real_gpus(&mut final_gpus).await {
                 warn!("真实GPU扫描失败，使用模拟GPU: {}", e);
-                gpus.extend(mock_gpus);
+                final_gpus.extend(mock_gpus);
             }
         }
 
-        let mut last_update = self.last_update.write().map_err(|e| {
-            CoreError::runtime(format!("获取更新时间锁失败: {}", e))
-        })?;
-        *last_update = SystemTime::now();
+        // 更新GPU列表
+        {
+            let mut gpus = self.gpus.write().map_err(|e| {
+                CoreError::runtime(format!("获取GPU列表锁失败: {}", e))
+            })?;
+            gpus.clear();
+            gpus.extend(final_gpus);
+        }
 
-        info!("✅ GPU扫描完成，发现 {} 个GPU设备", gpus.len());
+        // 更新时间戳
+        {
+            let mut last_update = self.last_update.write().map_err(|e| {
+                CoreError::runtime(format!("获取更新时间锁失败: {}", e))
+            })?;
+            *last_update = SystemTime::now();
+        }
+
+        let gpu_count = {
+            let gpus = self.gpus.read().map_err(|e| {
+                CoreError::runtime(format!("获取GPU列表锁失败: {}", e))
+            })?;
+            gpus.len()
+        };
+
+        info!("✅ GPU扫描完成，发现 {} 个GPU设备", gpu_count);
         Ok(())
     }
 
@@ -188,7 +213,7 @@ impl GpuManager {
     #[cfg(feature = "opencl")]
     async fn scan_opencl_gpus(&self, _gpus: &mut Vec<GpuInfo>) -> Result<(), CoreError> {
         debug!("🔍 扫描OpenCL GPU设备");
-        
+
         // 这里应该使用opencl3或ocl库来扫描OpenCL设备
         // 为了简化，我们暂时返回错误，让系统使用模拟GPU
         Err(CoreError::runtime("OpenCL扫描暂未实现".to_string()))
@@ -198,7 +223,7 @@ impl GpuManager {
     #[cfg(feature = "cuda")]
     async fn scan_cuda_gpus(&self, _gpus: &mut Vec<GpuInfo>) -> Result<(), CoreError> {
         debug!("🔍 扫描CUDA GPU设备");
-        
+
         // 这里应该使用CUDA运行时API来扫描CUDA设备
         // 为了简化，我们暂时返回错误，让系统使用模拟GPU
         Err(CoreError::runtime("CUDA扫描暂未实现".to_string()))
@@ -363,10 +388,10 @@ mod tests {
     async fn test_gpu_scanning() {
         let manager = GpuManager::new().unwrap();
         manager.initialize().await.unwrap();
-        
+
         let gpus = manager.scan_gpus().await;
         assert!(gpus.is_ok());
-        
+
         let gpu_list = gpus.unwrap();
         assert!(!gpu_list.is_empty());
     }
@@ -375,7 +400,7 @@ mod tests {
     async fn test_health_check() {
         let manager = GpuManager::new().unwrap();
         manager.initialize().await.unwrap();
-        
+
         let healthy = manager.is_healthy().await;
         assert!(healthy);
     }
