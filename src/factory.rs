@@ -108,8 +108,13 @@ impl CoreFactory for GpuCoreFactory {
                 if size == 0 {
                     return Err(CoreError::config("工作大小必须大于0".to_string()));
                 }
-                if size > 1024 {
-                    return Err(CoreError::config("工作大小不能超过1024".to_string()));
+                // GPU 工作大小可以更大，特别是对于 Metal 和 OpenCL
+                if size > 1048576 { // 1M 工作项上限
+                    return Err(CoreError::config("工作大小不能超过1048576".to_string()));
+                }
+                // 检查是否为2的幂次（GPU优化）
+                if size & (size - 1) != 0 {
+                    return Err(CoreError::config("工作大小应该是2的幂次（如1024, 2048, 4096, 65536等）".to_string()));
                 }
             } else {
                 return Err(CoreError::config("工作大小必须是整数".to_string()));

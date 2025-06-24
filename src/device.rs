@@ -25,7 +25,7 @@ pub struct GpuDevice {
     /// 目标算力 (H/s)
     target_hashrate: f64,
     /// 当前工作
-    current_work: Arc<Mutex<Option<Work>>>,
+    current_work: Arc<Mutex<Option<Arc<Work>>>>,
     /// GPU管理器
     gpu_manager: Arc<GpuManager>,
     /// 启动时间
@@ -374,7 +374,7 @@ impl MiningDevice for GpuDevice {
     }
 
     /// 提交工作
-    async fn submit_work(&mut self, work: Work) -> Result<(), DeviceError> {
+    async fn submit_work(&mut self, work: Arc<Work>) -> Result<(), DeviceError> {
         debug!("📤 向GPU设备 {} 提交工作", self.device_info.name);
 
         let mut current_work = self.current_work.lock().await;
@@ -502,7 +502,8 @@ impl MiningDevice for GpuDevice {
         Ok(())
     }
 
-
-
-
+    /// 获取设备的可变引用（用于类型转换）
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }

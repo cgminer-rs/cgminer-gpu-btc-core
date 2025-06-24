@@ -28,7 +28,7 @@ pub struct MetalDevice {
     /// 是否正在运行
     running: Arc<RwLock<bool>>,
     /// 当前工作
-    current_work: Arc<Mutex<Option<Work>>>,
+    current_work: Arc<Mutex<Option<Arc<Work>>>>,
     /// 启动时间
     start_time: Option<SystemTime>,
     /// 结果队列
@@ -276,7 +276,7 @@ impl MiningDevice for MetalDevice {
     }
 
     /// 提交工作
-    async fn submit_work(&mut self, work: Work) -> Result<(), DeviceError> {
+    async fn submit_work(&mut self, work: Arc<Work>) -> Result<(), DeviceError> {
         debug!("📤 向 Mac Metal GPU 设备 {} 提交工作", self.device_info.name);
 
         let mut current_work = self.current_work.lock().await;
@@ -394,5 +394,10 @@ impl MiningDevice for MetalDevice {
 
         debug!("✅ Mac Metal GPU 设备 {} 健康检查通过", self.device_info.name);
         Ok(true)
+    }
+
+    /// 获取设备的可变引用（用于类型转换）
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }

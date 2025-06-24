@@ -320,8 +320,10 @@ impl MiningCore for GpuMiningCore {
         }
 
         // 回退到通用 GPU 设备
-        let gpu_manager = self.gpu_manager.as_ref()
-            .ok_or_else(|| CoreError::runtime("GPU管理器未初始化".to_string()))?;
+        #[cfg(not(all(feature = "mac-metal", target_os = "macos")))]
+        {
+            let gpu_manager = self.gpu_manager.as_ref()
+                .ok_or_else(|| CoreError::runtime("GPU管理器未初始化".to_string()))?;
 
         // 从配置中获取参数
         let default_config = CoreConfig::default();
@@ -339,8 +341,9 @@ impl MiningCore for GpuMiningCore {
             gpu_manager.clone(),
         ).await?;
 
-        info!("✅ 通用 GPU 设备创建成功");
-        Ok(Box::new(device))
+            info!("✅ 通用 GPU 设备创建成功");
+            Ok(Box::new(device))
+        }
     }
 
     /// 获取所有设备
@@ -356,7 +359,7 @@ impl MiningCore for GpuMiningCore {
     }
 
     /// 提交工作到所有设备
-    async fn submit_work(&mut self, work: Work) -> Result<(), CoreError> {
+    async fn submit_work(&mut self, work: Arc<Work>) -> Result<(), CoreError> {
         debug!("📤 提交工作到所有GPU设备");
 
         let mut devices = self.devices.lock().await;
