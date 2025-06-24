@@ -4,7 +4,7 @@ use cgminer_core::{
     MiningCore, CoreInfo, CoreCapabilities, CoreConfig, CoreStats, CoreError,
     DeviceInfo, MiningDevice, Work, MiningResult
 };
-use crate::device::GpuDevice;
+
 use crate::gpu_manager::GpuManager;
 
 #[cfg(feature = "mac-metal")]

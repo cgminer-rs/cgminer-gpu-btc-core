@@ -7,7 +7,7 @@ use cgminer_core::{
 use crate::gpu_manager::GpuManager;
 use async_trait::async_trait;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tracing::{info, warn, error, debug};
 use fastrand;
@@ -70,60 +70,7 @@ impl GpuDevice {
         self.hashrate_tracker.get_cgminer_hashrate_string()
     }
 
-    /// 模拟GPU挖矿计算
-    async fn simulate_mining(&self, work: &Work) -> Result<Option<MiningResult>, DeviceError> {
-        debug!("⚡ GPU设备 {} 开始挖矿计算", self.device_info.name);
 
-        // 模拟GPU计算时间（比CPU快很多）
-        let compute_duration = Duration::from_millis(fastrand::u64(10..50)); // 10-50ms
-        tokio::time::sleep(compute_duration).await;
-
-        // 模拟找到有效结果的概率（GPU算力高，找到结果的概率也高）
-        let success_probability = 0.15; // 15% 概率找到有效结果
-
-        if fastrand::f64() < success_probability {
-            // 生成模拟的nonce
-            let nonce = fastrand::u32(..);
-
-            let result = MiningResult::new(
-                work.id,
-                self.device_info.id,
-                nonce,
-                vec![0u8; 32], // 模拟的hash
-                true, // meets_target
-            );
-
-            debug!("🎯 GPU设备 {} 找到有效结果!", self.device_info.name);
-            Ok(Some(result))
-        } else {
-            debug!("⚪ GPU设备 {} 本轮计算无有效结果", self.device_info.name);
-            Ok(None)
-        }
-    }
-
-    /// 更新设备统计信息
-    fn update_stats(&self, hashes_computed: u64) -> Result<(), DeviceError> {
-        let mut stats = self.stats.write().map_err(|e| {
-            DeviceError::hardware_error(format!("获取统计信息锁失败: {}", e))
-        })?;
-
-        stats.total_hashes += hashes_computed;
-        stats.last_updated = SystemTime::now();
-
-        // 计算算力
-        if let Some(start_time) = self.start_time {
-            let elapsed = SystemTime::now()
-                .duration_since(start_time)
-                .unwrap_or_default()
-                .as_secs_f64();
-
-            if elapsed > 0.0 {
-                stats.current_hashrate = cgminer_core::HashRate { hashes_per_second: stats.total_hashes as f64 / elapsed };
-            }
-        }
-
-        Ok(())
-    }
 
     /// 启动挖矿循环
     async fn start_mining_loop(&self) -> Result<(), DeviceError> {
