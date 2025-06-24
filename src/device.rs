@@ -2,7 +2,7 @@
 
 use cgminer_core::{
     MiningDevice, DeviceInfo, DeviceConfig, DeviceStats, DeviceError,
-    Work, MiningResult
+    Work, MiningResult, CgminerHashrateTracker
 };
 use crate::gpu_manager::GpuManager;
 use async_trait::async_trait;
@@ -34,6 +34,8 @@ pub struct GpuDevice {
     work_counter: Arc<RwLock<u64>>,
     /// 结果队列
     result_queue: Arc<Mutex<Vec<MiningResult>>>,
+    /// CGMiner风格的算力追踪器
+    hashrate_tracker: Arc<CgminerHashrateTracker>,
 }
 
 impl GpuDevice {
@@ -59,7 +61,13 @@ impl GpuDevice {
             start_time: None,
             work_counter: Arc::new(RwLock::new(0)),
             result_queue: Arc::new(Mutex::new(Vec::new())),
+            hashrate_tracker: Arc::new(CgminerHashrateTracker::new()),
         })
+    }
+
+    /// 获取CGMiner风格的算力字符串
+    pub fn get_cgminer_hashrate_string(&self) -> String {
+        self.hashrate_tracker.get_cgminer_hashrate_string()
     }
 
     /// 模拟GPU挖矿计算
@@ -125,6 +133,9 @@ impl GpuDevice {
         let result_queue = self.result_queue.clone();
         let target_hashrate = self.target_hashrate;
         let _device_id = self.device_info.id;
+        let stats = self.stats.clone();
+        let start_time = self.start_time;
+        let hashrate_tracker = self.hashrate_tracker.clone();
 
         tokio::spawn(async move {
             info!("🔄 GPU设备 {} 挖矿循环启动", device_name);
@@ -155,6 +166,33 @@ impl GpuDevice {
                         let mut queue = result_queue.lock().await;
                         queue.extend(batch_results.clone());
                         debug!("📦 GPU设备 {} 批处理完成，产生 {} 个结果", device_name, batch_results.len());
+                    }
+
+                    // 使用CGMiner风格的算力追踪器记录哈希数
+                    hashrate_tracker.add_hashes(nonce_count as u64);
+                    hashrate_tracker.update_averages();
+
+                    // 更新传统的统计信息（兼容性）
+                    if let Ok(mut stats_guard) = stats.write() {
+                        stats_guard.total_hashes += nonce_count as u64;
+                        stats_guard.last_updated = SystemTime::now();
+
+                        // 从CGMiner算力追踪器获取当前算力
+                        let (avg_5s, _, _, _, avg_total) = hashrate_tracker.get_hashrates();
+                        stats_guard.current_hashrate = cgminer_core::HashRate {
+                            hashes_per_second: avg_5s
+                        };
+
+                        // 每100次循环输出一次详细的CGMiner风格算力信息
+                        static mut LOOP_COUNTER: u64 = 0;
+                        unsafe {
+                            LOOP_COUNTER += 1;
+                            if LOOP_COUNTER % 100 == 0 {
+                                debug!("GPU设备 {} CGMiner风格算力: {}",
+                                       device_name,
+                                       hashrate_tracker.get_cgminer_hashrate_string());
+                            }
+                        }
                     }
 
                     // 控制算力，避免过度消耗资源
@@ -315,6 +353,9 @@ impl MiningDevice for GpuDevice {
             }
         }
 
+        // 设置开始时间
+        self.start_time = Some(SystemTime::now());
+
         // 启动挖矿循环
         self.start_mining_loop().await?;
 
@@ -325,8 +366,6 @@ impl MiningDevice for GpuDevice {
             })?;
             *running = true;
         }
-
-        self.start_time = Some(SystemTime::now());
 
         info!("✅ GPU设备 {} 启动完成", self.device_info.name);
         Ok(())
@@ -400,8 +439,25 @@ impl MiningDevice for GpuDevice {
 
             debug!("📥 从GPU设备 {} 获取到挖矿结果", self.device_info.name);
 
-            // 更新统计信息
-            self.update_stats(1000000)?; // 假设每个结果代表100万次哈希计算
+            // 使用CGMiner算力追踪器记录份额
+            if result.meets_target {
+                self.hashrate_tracker.increment_accepted();
+            } else {
+                self.hashrate_tracker.increment_rejected();
+            }
+
+            // 更新传统的统计信息（兼容性）
+            {
+                let mut stats = self.stats.write().map_err(|e| {
+                    DeviceError::hardware_error(format!("获取统计信息锁失败: {}", e))
+                })?;
+
+                if result.meets_target {
+                    stats.accepted_work += 1;
+                } else {
+                    stats.rejected_work += 1;
+                }
+            }
 
             Ok(Some(result))
         } else {

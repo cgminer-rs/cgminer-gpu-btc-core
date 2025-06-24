@@ -411,12 +411,81 @@ impl MiningCore for GpuMiningCore {
         Ok(results)
     }
 
-    /// 获取核心统计信息
+
+
+        /// 获取核心统计信息
     async fn get_stats(&self) -> Result<CoreStats, CoreError> {
-        let stats = self.stats.read().map_err(|e| {
-            CoreError::runtime(format!("获取统计信息锁失败: {}", e))
-        })?;
-        Ok(stats.clone())
+        // 实时计算统计信息
+        let devices = self.devices.lock().await;
+        let mut total_hashrate = 0.0;
+        let mut total_accepted = 0;
+        let mut total_rejected = 0;
+        let mut total_errors = 0;
+        let mut total_hashes = 0u64;
+        let active_devices = devices.len() as u32;
+
+        for (device_id, device) in devices.iter() {
+            match device.get_stats().await {
+                Ok(device_stats) => {
+                    total_hashrate += device_stats.current_hashrate.hashes_per_second;
+                    total_accepted += device_stats.accepted_work;
+                    total_rejected += device_stats.rejected_work;
+                    total_errors += device_stats.hardware_errors;
+                    total_hashes += device_stats.total_hashes;
+
+                    debug!("设备 {} 算力: {:.2} H/s, 总哈希: {}",
+                           device_id, device_stats.current_hashrate.hashes_per_second, device_stats.total_hashes);
+                }
+                Err(e) => {
+                    error!("获取设备 {} 统计信息失败: {}", device_id, e);
+                }
+            }
+        }
+
+        // 计算平均算力
+        let average_hashrate = if let Some(start_time) = self.start_time {
+            let elapsed = SystemTime::now()
+                .duration_since(start_time)
+                .unwrap_or_default()
+                .as_secs_f64();
+
+            if elapsed > 0.0 {
+                total_hashes as f64 / elapsed
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        // 更新并返回统计信息
+        {
+            let mut stats = self.stats.write().map_err(|e| {
+                CoreError::runtime(format!("获取统计信息锁失败: {}", e))
+            })?;
+
+            stats.core_name = self.core_info.name.clone();
+            stats.device_count = devices.len() as u32;
+            stats.active_devices = active_devices;
+            stats.total_hashrate = total_hashrate;
+            stats.average_hashrate = average_hashrate;
+            stats.accepted_work = total_accepted;
+            stats.rejected_work = total_rejected;
+            stats.hardware_errors = total_errors;
+
+            if let Some(start_time) = self.start_time {
+                stats.uptime = SystemTime::now()
+                    .duration_since(start_time)
+                    .unwrap_or_default();
+            }
+
+            stats.last_updated = SystemTime::now();
+
+            debug!("核心统计: 活跃设备={}, 总算力={:.2} H/s, 平均算力={:.2} H/s",
+                   active_devices, total_hashrate, average_hashrate);
+
+            Ok(stats.clone())
+        }
     }
 
     /// 健康检查
