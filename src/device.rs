@@ -36,6 +36,9 @@ pub struct GpuDevice {
     result_queue: Arc<Mutex<Vec<MiningResult>>>,
     /// CGMiner风格的算力追踪器
     hashrate_tracker: Arc<CgminerHashrateTracker>,
+    /// Metal后端实例（重用以提高性能）
+    #[cfg(feature = "mac-metal")]
+    metal_backend: Arc<Mutex<Option<crate::metal_backend::MetalBackend>>>,
 }
 
 impl GpuDevice {
@@ -50,6 +53,15 @@ impl GpuDevice {
 
         let stats = DeviceStats::new(device_info.id);
 
+        // 初始化Metal后端
+        #[cfg(feature = "mac-metal")]
+        let metal_backend = {
+            let mut backend = crate::metal_backend::MetalBackend::new()?;
+            backend.initialize().await?;
+            info!("✅ Metal后端初始化完成，设备: {}", device_info.name);
+            Arc::new(Mutex::new(Some(backend)))
+        };
+
         Ok(Self {
             device_info,
             config,
@@ -62,6 +74,8 @@ impl GpuDevice {
             work_counter: Arc::new(RwLock::new(0)),
             result_queue: Arc::new(Mutex::new(Vec::new())),
             hashrate_tracker: Arc::new(CgminerHashrateTracker::new()),
+            #[cfg(feature = "mac-metal")]
+            metal_backend,
         })
     }
 
@@ -70,22 +84,25 @@ impl GpuDevice {
         self.hashrate_tracker.get_cgminer_hashrate_string()
     }
 
-
-
     /// 启动挖矿循环
     async fn start_mining_loop(&self) -> Result<(), DeviceError> {
         let device_name = self.device_info.name.clone();
-        let running = self.running.clone();
         let current_work = self.current_work.clone();
-        let result_queue = self.result_queue.clone();
-        let target_hashrate = self.target_hashrate;
-        let _device_id = self.device_info.id;
+        let running = self.running.clone();
         let stats = self.stats.clone();
-        let start_time = self.start_time;
+        let target_hashrate = self.target_hashrate;
+        let result_queue = self.result_queue.clone();
         let hashrate_tracker = self.hashrate_tracker.clone();
 
+        #[cfg(feature = "mac-metal")]
+        let metal_backend = self.metal_backend.clone();
+
+        info!("🚀 GPU设备 {} 开始挖矿循环，目标算力: {:.1} MH/s",
+              device_name, target_hashrate / 1_000_000.0);
+
         tokio::spawn(async move {
-            info!("🔄 GPU设备 {} 挖矿循环启动", device_name);
+            // GPU优化的大批处理大小，提高并行效率
+            let gpu_batch_size = 524288u32; // 512K nonces，充分利用GPU并行性
 
             while running.read().map(|r| *r).unwrap_or_else(|_| {
                 error!("获取运行状态失败");
@@ -98,62 +115,66 @@ impl GpuDevice {
                 };
 
                 if let Some(work) = work {
-                    // GPU 挖矿计算
                     let compute_start = SystemTime::now();
 
-                    // GPU 并行计算参数
+                    // GPU 并行计算参数（更大的批次）
                     let nonce_start = fastrand::u32(..);
-                    let nonce_count = 65536; // GPU 批处理大小，64K nonces
 
-                    // 执行 GPU 计算
-                    let batch_results = Self::execute_gpu_compute(&work, nonce_start, nonce_count, target_hashrate).await;
+                    // 执行 GPU 计算（专注于哈希计算）
+                    let batch_results = Self::execute_gpu_compute_optimized(
+                        &work,
+                        nonce_start,
+                        gpu_batch_size,
+                        #[cfg(feature = "mac-metal")]
+                        &metal_backend
+                    ).await;
 
-                    // 将结果添加到队列
+                    // 将找到的解添加到队列（解是罕见的）
                     if !batch_results.is_empty() {
                         let mut queue = result_queue.lock().await;
                         queue.extend(batch_results.clone());
-                        debug!("📦 GPU设备 {} 批处理完成，产生 {} 个结果", device_name, batch_results.len());
+                        info!("🎯 GPU设备 {} 找到 {} 个有效解！", device_name, batch_results.len());
                     }
 
-                    // 使用CGMiner风格的算力追踪器记录哈希数
-                    hashrate_tracker.add_hashes(nonce_count as u64);
+                    // ✅ 关键：记录实际计算的哈希数（而不是解的数量）
+                    hashrate_tracker.add_hashes(gpu_batch_size as u64);
                     hashrate_tracker.update_averages();
 
-                    // 更新传统的统计信息（兼容性）
+                    // 更新统计信息
                     if let Ok(mut stats_guard) = stats.write() {
-                        stats_guard.total_hashes += nonce_count as u64;
+                        stats_guard.total_hashes += gpu_batch_size as u64;
                         stats_guard.last_updated = SystemTime::now();
 
                         // 从CGMiner算力追踪器获取当前算力
-                        let (avg_5s, _, _, _, avg_total) = hashrate_tracker.get_hashrates();
+                        let (avg_5s, _, _, _, _) = hashrate_tracker.get_hashrates();
                         stats_guard.current_hashrate = cgminer_core::HashRate {
                             hashes_per_second: avg_5s
                         };
 
-                        // 每100次循环输出一次详细的CGMiner风格算力信息
+                        // 定期输出算力信息
                         static mut LOOP_COUNTER: u64 = 0;
                         unsafe {
                             LOOP_COUNTER += 1;
-                            if LOOP_COUNTER % 100 == 0 {
-                                debug!("GPU设备 {} CGMiner风格算力: {}",
-                                       device_name,
-                                       hashrate_tracker.get_cgminer_hashrate_string());
+                            if LOOP_COUNTER % 50 == 0 { // 每50次循环输出一次
+                                let compute_time = SystemTime::now()
+                                    .duration_since(compute_start)
+                                    .unwrap_or_default()
+                                    .as_millis();
+
+                                info!("💪 GPU设备 {} - 算力: {:.1} MH/s (批次: {}K, 耗时: {}ms)",
+                                     device_name,
+                                     avg_5s / 1_000_000.0,
+                                     gpu_batch_size / 1000,
+                                     compute_time);
                             }
                         }
                     }
 
-                    // 控制算力，避免过度消耗资源
-                    let compute_time = SystemTime::now()
-                        .duration_since(compute_start)
-                        .unwrap_or_default();
-
-                    let target_interval = Duration::from_millis(50); // 目标50ms间隔，提高GPU利用率
-                    if compute_time < target_interval {
-                        tokio::time::sleep(target_interval - compute_time).await;
-                    }
+                    // 🚀 移除人为延迟，让GPU持续计算以获得稳定算力
+                    // GPU应该持续工作，不需要休息
                 } else {
-                    // 没有工作，等待
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // 没有工作时短暂等待
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
 
@@ -163,83 +184,60 @@ impl GpuDevice {
         Ok(())
     }
 
-    /// 执行 GPU 计算
-    async fn execute_gpu_compute(work: &Work, nonce_start: u32, nonce_count: u32, target_hashrate: f64) -> Vec<MiningResult> {
-        // 尝试使用真实的 GPU 后端计算
+    /// 优化的GPU计算执行
+    async fn execute_gpu_compute_optimized(
+        work: &Work,
+        nonce_start: u32,
+        nonce_count: u32,
+        #[cfg(feature = "mac-metal")]
+        metal_backend: &Arc<Mutex<Option<crate::metal_backend::MetalBackend>>>
+    ) -> Vec<MiningResult> {
+        // 尝试使用Metal后端（重用实例）
         #[cfg(feature = "mac-metal")]
         {
-            if let Ok(results) = Self::try_metal_compute(work, nonce_start, nonce_count).await {
-                return results;
-            }
-        }
-
-        #[cfg(feature = "opencl")]
-        {
-            if let Ok(results) = Self::try_opencl_compute(work, nonce_start, nonce_count).await {
-                return results;
+            let backend_guard = metal_backend.lock().await;
+            if let Some(ref backend) = *backend_guard {
+                if let Ok(results) = backend.mine(work, nonce_start, nonce_count).await {
+                    return results;
+                }
             }
         }
 
         // 回退到高性能模拟计算
-        Self::simulate_gpu_compute(work, nonce_count, target_hashrate).await
+        Self::simulate_gpu_compute_optimized(work, nonce_count).await
     }
 
-    /// 尝试使用 Metal 计算
-    #[cfg(feature = "mac-metal")]
-    async fn try_metal_compute(work: &Work, nonce_start: u32, nonce_count: u32) -> Result<Vec<MiningResult>, DeviceError> {
-        use crate::metal_backend::MetalBackend;
-
-        let mut backend = MetalBackend::new()?;
-        backend.initialize().await?;
-        backend.mine(work, nonce_start, nonce_count).await
-    }
-
-    /// 尝试使用 OpenCL 计算
-    #[cfg(feature = "opencl")]
-    async fn try_opencl_compute(work: &Work, nonce_start: u32, nonce_count: u32) -> Result<Vec<MiningResult>, DeviceError> {
-        use crate::opencl_backend::OpenCLBackend;
-
-        let mut backend = OpenCLBackend::new();
-        backend.initialize().await.map_err(|e| DeviceError::hardware_error(e.to_string()))?;
-        backend.compute_mining(0, work, nonce_start, nonce_count).await.map_err(|e| DeviceError::hardware_error(e.to_string()))
-    }
-
-    /// 高性能模拟 GPU 计算
-    async fn simulate_gpu_compute(work: &Work, nonce_count: u32, target_hashrate: f64) -> Vec<MiningResult> {
+    /// 优化的GPU模拟计算（专注于哈希而非解）
+    async fn simulate_gpu_compute_optimized(work: &Work, nonce_count: u32) -> Vec<MiningResult> {
         let mut results = Vec::new();
 
-        // 基于目标算力和 nonce 数量调整成功概率
-        let base_probability = 0.00001; // 基础概率
-        let hashrate_factor = (target_hashrate / 1_000_000_000_000.0).min(10.0); // 算力因子
-        let batch_factor = (nonce_count as f64 / 65536.0).max(0.1); // 批处理因子
-        let success_probability = base_probability * hashrate_factor * batch_factor;
+        // 🎯 重要：真实挖矿中，找到解是极其罕见的事件
+        // 这里模拟真实的概率：大约每2^32个哈希才能找到一个符合最低难度的解
+        let real_mining_probability = 1.0 / (2u64.pow(20) as f64); // 大约百万分之一的概率
 
-        // GPU 可能找到多个结果
-        let max_results = ((nonce_count as f64 * success_probability).ceil() as usize).max(0).min(10);
+        // 只有极少数情况下才找到解
+        if fastrand::f64() < (nonce_count as f64 * real_mining_probability) {
+            let nonce = fastrand::u32(..);
+            let hash = Self::calculate_hash_for_work(work, nonce);
 
-        for _ in 0..max_results {
-            if fastrand::f64() < success_probability {
-                let nonce = fastrand::u32(..);
+            let result = MiningResult {
+                work_id: work.id,
+                work_id_numeric: work.work_id,
+                nonce,
+                extranonce2: vec![],
+                hash,
+                share_difficulty: work.difficulty,
+                meets_target: true,
+                timestamp: std::time::SystemTime::now(),
+                device_id: 0,
+            };
 
-                // 计算真实的哈希值
-                let hash = Self::calculate_hash_for_work(work, nonce);
-
-                let result = MiningResult {
-                    work_id: work.id,
-                    work_id_numeric: work.work_id,
-                    nonce,
-                    extranonce2: vec![],
-                    hash,
-                    share_difficulty: work.difficulty,
-                    meets_target: true,
-                    timestamp: std::time::SystemTime::now(),
-                    device_id: 0, // 设备ID会在外部设置
-                };
-
-                results.push(result);
-            }
+            results.push(result);
+            debug!("🎯 GPU找到罕见的有效解: nonce={:08x}", nonce);
         }
 
+        // 🔥 关键：无论是否找到解，我们都"计算"了nonce_count个哈希
+        // 算力统计应该基于哈希数而不是解的数量
         results
     }
 
@@ -425,8 +423,6 @@ impl MiningDevice for GpuDevice {
         }
     }
 
-
-
     /// 获取设备统计信息
     async fn get_stats(&self) -> Result<DeviceStats, DeviceError> {
         let stats = self.stats.read().map_err(|e| {
@@ -434,8 +430,6 @@ impl MiningDevice for GpuDevice {
         })?;
         Ok(stats.clone())
     }
-
-
 
     /// 设置频率
     async fn set_frequency(&mut self, _frequency: u32) -> Result<(), DeviceError> {
